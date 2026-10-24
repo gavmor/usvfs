@@ -35,7 +35,7 @@ endfunction()
 # loading
 #
 function(usvfs_target_link_usvfs TARGET)
-    target_link_libraries(${TARGET} PRIVATE usvfs_dll)
+    target_link_libraries(${TARGET} PRIVATE usvfs_dll delayimp)
     target_link_options(${TARGET} PRIVATE "/DELAYLOAD:usvfs${ARCH_POSTFIX}.dll")
 endfunction()
 

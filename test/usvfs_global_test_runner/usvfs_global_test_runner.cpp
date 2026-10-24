@@ -25,6 +25,12 @@ TEST_F(UsvfsGlobalTest, RedFileSystemTest)
   ASSERT_DIRECTORY_EQ(ExpectedFolder(), ActualFolder());
 }
 
+TEST_F(UsvfsGlobalTest, MultiModNVSETest)
+{
+  ASSERT_EQ(0, Run());
+  ASSERT_DIRECTORY_EQ(ExpectedFolder(), ActualFolder());
+}
+
 TEST_F(UsvfsGlobalTest, SkipFilesTest)
 {
   SetUpOverwrite(true);

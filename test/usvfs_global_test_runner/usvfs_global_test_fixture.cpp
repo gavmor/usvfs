@@ -4,6 +4,34 @@
 #include <format>
 #include <fstream>
 
+#include <boost/filesystem.hpp>
+
+// WINE WORKAROUND (throwaway investigation only, not for upstream):
+// std::filesystem::copy() with copy_options::recursive calls CopyFile2 via the
+// MSVC STL on Windows 10+, which Wine 9.0's kernel32 does not implement, aborting
+// the process. boost::filesystem's recursive copy uses CopyFileW instead, which
+// Wine does implement.
+static void wine_safe_recursive_copy(const std::filesystem::path& from,
+                                     const std::filesystem::path& to)
+{
+  namespace bfs = boost::filesystem;
+  bfs::path bfrom{from.native()};
+  bfs::path bto{to.native()};
+  bfs::create_directories(bto);
+  for (bfs::recursive_directory_iterator it{bfrom};
+       it != bfs::recursive_directory_iterator{}; ++it) {
+    const auto relative = bfs::relative(it->path(), bfrom);
+    const auto dest     = bto / relative;
+    if (bfs::is_directory(it->status())) {
+      bfs::create_directories(dest);
+    } else {
+      bfs::create_directories(dest.parent_path());
+      bfs::copy_file(it->path(), dest,
+                     bfs::copy_options::overwrite_existing);
+    }
+  }
+}
+
 #include <gtest/gtest.h>
 
 #include <stringcast.h>
@@ -141,7 +169,7 @@ void UsvfsGlobalTest::PrepareFileSystem() const
   // copy fixtures
   const auto fixtures = path_to_usvfs_global_test_figures(m_group) / "source";
   if (exists(fixtures)) {
-    copy(fixtures, m_temporary_folder, std::filesystem::copy_options::recursive);
+    wine_safe_recursive_copy(fixtures, m_temporary_folder);
   }
 }
 

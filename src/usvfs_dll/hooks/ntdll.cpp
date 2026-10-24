@@ -292,6 +292,129 @@ bool isDeviceFile(std::wstring_view name)
   }
 }
 
+namespace {
+
+// Synthesizes a directory-information record in `targetClass`'s format from
+// data already obtained via a FileBothDirectoryInformation (class 3) query -
+// used as a fallback when the real NtQueryDirectoryFile call for the info
+// class the caller actually asked for fails with STATUS_INVALID_INFO_CLASS.
+//
+// Observed in practice (Wine 9.0 / GE-Proton 10-14, 32-bit WOW64 target):
+// this build's NtQueryDirectoryFile syscall only implements the "classic"
+// info classes - FileFullDirectoryInformation and FileBothDirectoryInformation
+// work; every "Id"/"Extd" (Windows 10+) variant fails outright with
+// STATUS_INVALID_INFO_CLASS. Wine's own kernelbase.dll FindFirstFileExW
+// implementation requests FileIdExtdDirectoryInformation (class 60)
+// internally, so without this fallback every virtual (mod-provided, USVFS
+// redirection-tree) directory entry is silently dropped from every merged
+// enumeration - see addVirtualSearchResult below, which treats any non-
+// STATUS_NO_MORE_FILES failure as "this source exhausted" and moves on
+// without surfacing an error. Real on-disk content is unaffected because
+// it's opened by known name (NtCreateFile/NtOpenFile, both confirmed working
+// under this same Wine build), never discovered via enumeration.
+//
+// All of these structs share an identical field-for-field prefix through
+// EaSize (verified against ntdll_declarations.h - note FileDirectoryInformation
+// is the one exception, lacking EaSize entirely, and is not handled here since
+// it was never observed failing and is the oldest, most universally-supported
+// class). Only the tail (short name / 128-bit file ID / reparse tag) differs
+// between classes, and those fields are synthesized with safe zeroed defaults
+// since FileBothDirectoryInformation carries neither a real file ID nor a
+// reparse tag; ShortName is a separate, already-handled corner case (see this
+// header's own Wine-only ShortName skip) and is zeroed here too rather than
+// re-deriving it.
+ULONG SynthesizeDirInfoFromBoth(FILE_INFORMATION_CLASS targetClass,
+                                const FILE_BOTH_DIR_INFORMATION* src, PVOID dest,
+                                ULONG destCapacity)
+{
+  const ULONG nameBytes = src->FileNameLength;
+
+#define USVFS_COPY_DIRINFO_PREFIX(DestType)                                           \
+  auto* out            = reinterpret_cast<DestType*>(dest);                           \
+  out->NextEntryOffset = 0;                                                           \
+  out->FileIndex       = src->FileIndex;                                              \
+  out->CreationTime    = src->CreationTime;                                           \
+  out->LastAccessTime  = src->LastAccessTime;                                         \
+  out->LastWriteTime   = src->LastWriteTime;                                          \
+  out->ChangeTime      = src->ChangeTime;                                             \
+  out->EndOfFile       = src->EndOfFile;                                              \
+  out->AllocationSize  = src->AllocationSize;                                         \
+  out->FileAttributes  = src->FileAttributes;                                         \
+  out->FileNameLength  = nameBytes;                                                   \
+  out->EaSize          = src->EaSize;
+
+  switch (targetClass) {
+  case FileFullDirectoryInformation: {
+    ULONG needed = static_cast<ULONG>(offsetof(FILE_FULL_DIR_INFORMATION, FileName))
+                   + nameBytes;
+    if (needed > destCapacity) {
+      return 0;
+    }
+    USVFS_COPY_DIRINFO_PREFIX(FILE_FULL_DIR_INFORMATION)
+    memcpy(out->FileName, src->FileName, nameBytes);
+    return needed;
+  }
+  case FileIdFullDirectoryInformation: {
+    ULONG needed = static_cast<ULONG>(offsetof(FILE_ID_FULL_DIR_INFORMATION, FileName))
+                   + nameBytes;
+    if (needed > destCapacity) {
+      return 0;
+    }
+    USVFS_COPY_DIRINFO_PREFIX(FILE_ID_FULL_DIR_INFORMATION)
+    out->FileId.QuadPart = 0;
+    memcpy(out->FileName, src->FileName, nameBytes);
+    return needed;
+  }
+  case FileIdBothDirectoryInformation: {
+    ULONG needed = static_cast<ULONG>(offsetof(FILE_ID_BOTH_DIR_INFORMATION, FileName))
+                   + nameBytes;
+    if (needed > destCapacity) {
+      return 0;
+    }
+    USVFS_COPY_DIRINFO_PREFIX(FILE_ID_BOTH_DIR_INFORMATION)
+    out->ShortNameLength = 0;
+    memset(out->ShortName, 0, sizeof(out->ShortName));
+    out->FileId.QuadPart = 0;
+    memcpy(out->FileName, src->FileName, nameBytes);
+    return needed;
+  }
+  case FileIdExtdDirectoryInformation: {
+    ULONG needed = static_cast<ULONG>(offsetof(FILE_ID_EXTD_DIR_INFORMATION, FileName))
+                   + nameBytes;
+    if (needed > destCapacity) {
+      return 0;
+    }
+    USVFS_COPY_DIRINFO_PREFIX(FILE_ID_EXTD_DIR_INFORMATION)
+    out->ReparsePointTag = 0;
+    memset(&out->FileId, 0, sizeof(out->FileId));
+    memcpy(out->FileName, src->FileName, nameBytes);
+    return needed;
+  }
+  case FileIdExtdBothDirectoryInformation: {
+    ULONG needed =
+        static_cast<ULONG>(offsetof(FILE_ID_EXTD_BOTH_DIR_INFORMATION, FileName))
+        + nameBytes;
+    if (needed > destCapacity) {
+      return 0;
+    }
+    USVFS_COPY_DIRINFO_PREFIX(FILE_ID_EXTD_BOTH_DIR_INFORMATION)
+    out->ReparsePointTag = 0;
+    memset(&out->FileId, 0, sizeof(out->FileId));
+    out->ShortNameLength = 0;
+    memset(out->ShortName, 0, sizeof(out->ShortName));
+    memcpy(out->FileName, src->FileName, nameBytes);
+    return needed;
+  }
+  default:
+    return 0;  // unsupported target class - caller surfaces the original failure
+  }
+
+#undef USVFS_COPY_DIRINFO_PREFIX
+}
+
+}  // namespace
+
+
 NTSTATUS addNtSearchData(HANDLE hdl, PUNICODE_STRING FileName,
                          const std::wstring& fakeName,
                          FILE_INFORMATION_CLASS FileInformationClass, PVOID& buffer,
@@ -307,6 +430,35 @@ NTSTATUS addNtSearchData(HANDLE hdl, PUNICODE_STRING FileName,
     res = NtQueryDirectoryFile(hdl, event, apcRoutine, apcContext, &status, buffer,
                                bufferSize, FileInformationClass, returnSingleEntry,
                                FileName, FALSE);
+
+    if ((res == STATUS_INVALID_INFO_CLASS)
+        && (FileInformationClass != FileBothDirectoryInformation)) {
+      // See SynthesizeDirInfoFromBoth above: this Wine/Proton build's real
+      // NtQueryDirectoryFile doesn't implement the info class the caller
+      // asked for. Retry with the universally-supported classic class and
+      // synthesize a record in the originally-requested format instead of
+      // letting this failure propagate and silently drop the entry.
+      alignas(8) BYTE fallbackBuf[4096];
+      IO_STATUS_BLOCK fallbackStatus{};
+      NTSTATUS fallbackRes = NtQueryDirectoryFile(
+          hdl, event, apcRoutine, apcContext, &fallbackStatus, fallbackBuf,
+          sizeof(fallbackBuf), FileBothDirectoryInformation, returnSingleEntry,
+          FileName, FALSE);
+      if ((fallbackRes == STATUS_SUCCESS) && (fallbackStatus.Information > 0)) {
+        const auto* entry =
+            reinterpret_cast<const FILE_BOTH_DIR_INFORMATION*>(fallbackBuf);
+        ULONG written =
+            SynthesizeDirInfoFromBoth(FileInformationClass, entry, buffer, bufferSize);
+        if (written > 0) {
+          status.Information = written;
+          res                = STATUS_SUCCESS;
+        } else {
+          res = fallbackRes;
+        }
+      } else {
+        res = fallbackRes;
+      }
+    }
 
     if ((res != STATUS_SUCCESS) || (status.Information <= 0)) {
       bufferSize = 0UL;

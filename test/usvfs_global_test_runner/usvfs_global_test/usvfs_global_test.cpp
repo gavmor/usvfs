@@ -203,6 +203,41 @@ TEST(SkipFilesTest, SkipFilesTest)
   write_content(data / "readme.skip", "readme.skip in overwrite");
 }
 
+// multi-root merge test: mirrors MO2's real-world layout where several
+// independently-rooted mod folders each contribute files into the SAME virtual
+// subfolder (Data\NVSE\Plugins), with long (>8 char) filenames to exercise the
+// GetShortPathNameW()-under-Wine codepath.
+//
+TEST(MultiModNVSETest, MultiModNVSETest)
+{
+  const auto data    = parameters.data();
+  const auto plugins = data / "NVSE" / "Plugins";
+
+  ASSERT_TRUE(std::filesystem::exists(plugins))
+      << "merged NVSE/Plugins directory not visible at all";
+
+  // classic FindFirstFile/FindNextFile-style enumeration (what NVSE's plugin
+  // loader actually does), via boost::filesystem directory_iterator
+  const boost::filesystem::path bplugins{plugins.native()};
+  std::vector<std::string> entries;
+  for (boost::filesystem::directory_iterator it{bplugins};
+       it != boost::filesystem::directory_iterator{}; ++it) {
+    entries.push_back(it->path().filename().string());
+  }
+
+  for (const auto& e : entries) {
+    std::cerr << "MultiModNVSETest: enumerated entry: " << e << "\n";
+  }
+
+  ASSERT_THAT(entries, ::testing::UnorderedElementsAre(
+                           "jip_lnvse_test_plugin.dll",
+                           "nvse_console_clipboard_test.dll"))
+      << "merged directory listing from multiple mod roots is incomplete/wrong";
+
+  ASSERT_TRUE(std::filesystem::exists(plugins / "jip_lnvse_test_plugin.dll"));
+  ASSERT_TRUE(std::filesystem::exists(plugins / "nvse_console_clipboard_test.dll"));
+}
+
 int main(int argc, char* argv[])
 {
   testing::InitGoogleTest(&argc, argv);
